@@ -681,8 +681,11 @@ def main():
             break
         except Exception as e:
             log.error(f"Erreur boucle : {e}")
-            tg_alert(cfg, f"[!] Erreur : {e} — nouvel essai dans 60 s")
-            time.sleep(60)
+            indice = ""
+            if "api-key-invalid" in str(e):
+                indice = " (clé IG suspendue : utilisée en parallèle ailleurs ? — voir clé dédiée)"
+            tg_alert(cfg, f"[!] Erreur : {e}{indice} — nouvel essai dans 20 s")
+            time.sleep(20)
             try:
                 ig.login()
             except Exception as e2:
