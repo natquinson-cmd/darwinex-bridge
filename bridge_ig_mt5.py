@@ -122,13 +122,16 @@ def save_state(state):
 # ══════════════════════════════════════════════════════════════════════════
 # TELEGRAM (optionnel)
 # ══════════════════════════════════════════════════════════════════════════
-def tg_alert(cfg, msg):
+def tg_alert(cfg, msg, parse_mode=None):
     tok = cfg.get("telegram", {}).get("bot_token", "")
     chat = cfg.get("telegram", {}).get("chat_id", "")
     if not tok or not chat:
         return
     import ssl
-    data = json.dumps({"chat_id": chat, "text": f"Pont IG->MT5\n{msg}"}).encode()
+    payload = {"chat_id": chat, "text": f"Pont IG → MT5\n{msg}"}
+    if parse_mode:
+        payload["parse_mode"] = parse_mode
+    data = json.dumps(payload).encode()
     url = f"https://api.telegram.org/bot{tok}/sendMessage"
     # Voie sûre (certifi si dispo, sinon magasin système) ; repli sans vérif si le
     # magasin de CA racine du VPS n'est pas à jour (notification non critique).
@@ -493,13 +496,17 @@ def sync_cycle(cfg, ig, state, symbols):
                 gain = pnl >= 0
                 # console (texte simple, lisible dans voir_pont.bat)
                 log.info(f"[FERME] {sym} vol={vol} PnL={pnl:+.0f} {cur} ({pct:+.2f}%) (IG {deal_id})")
-                # Telegram (couleur + drapeau + détails)
+                # Telegram : bloc "diff" → montant en VERT (+) ou ROUGE (-)
                 head = "🟢 GAIN" if gain else "🔴 PERTE"
                 flag, name = instrument_display(sym)
+                pnl_line = f"{pnl:+.0f} {cur}   ({pct:+.2f} %)"  # 1er caractère + ou - = couleur
                 detail = ""
                 if info.get("price_open") and info.get("price_close"):
                     detail = f"\n{info['direction']} {vol} lot · {info['price_open']} → {info['price_close']}"
-                tg_alert(cfg, f"{head} — {flag} {name} clôturé\n{pnl:+.0f} {cur}  ·  {pct:+.2f} %{detail}")
+                tg_alert(cfg,
+                         f"{head} — {flag} <b>{name}</b> clôturé\n"
+                         f"<pre><code class=\"language-diff\">{pnl_line}</code></pre>{detail}",
+                         parse_mode="HTML")
             else:
                 log.info(f"[FERME] {sym} vol={vol} (IG {deal_id} clôturé)")
                 tg_alert(cfg, f"[FERME] {sym} clôturé")
