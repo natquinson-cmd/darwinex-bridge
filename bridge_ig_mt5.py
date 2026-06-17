@@ -496,16 +496,16 @@ def sync_cycle(cfg, ig, state, symbols):
                 gain = pnl >= 0
                 # console (texte simple, lisible dans voir_pont.bat)
                 log.info(f"[FERME] {sym} vol={vol} PnL={pnl:+.0f} {cur} ({pct:+.2f}%) (IG {deal_id})")
-                # Telegram : bloc "diff" → montant en VERT (+) ou ROUGE (-)
+                # Telegram : gros emoji de couleur + montant en GRAS (lisible sur fond
+                # sombre, gain comme perte — le bloc diff rendait le rouge peu lisible).
                 head = "🟢 GAIN" if gain else "🔴 PERTE"
                 flag, name = instrument_display(sym)
-                pnl_line = f"{pnl:+.0f} {cur}   ({pct:+.2f} %)"  # 1er caractère + ou - = couleur
                 detail = ""
                 if info.get("price_open") and info.get("price_close"):
                     detail = f"\n{info['direction']} {vol} lot · {info['price_open']} → {info['price_close']}"
                 tg_alert(cfg,
                          f"{head} — {flag} <b>{name}</b> clôturé\n"
-                         f"<pre><code class=\"language-diff\">{pnl_line}</code></pre>{detail}",
+                         f"{head[0]} <b>{pnl:+.0f} {cur}</b>   (<b>{pct:+.2f} %</b>){detail}",
                          parse_mode="HTML")
             else:
                 log.info(f"[FERME] {sym} vol={vol} (IG {deal_id} clôturé)")
