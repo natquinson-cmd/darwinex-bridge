@@ -197,12 +197,16 @@ class IGClient:
         log.info("Connecté à l'API IG.")
 
     def _authed(self, path, version="2"):
-        """GET avec re-login automatique si la session a expiré."""
+        """GET avec re-login automatique si la session a expiré.
+        IG formule parfois une session expirée en 'api-key-invalid' (403) :
+        on la traite comme une expiration → reconnexion immédiate + nouvel essai,
+        de façon transparente (pas d'erreur remontée ni de notif)."""
         try:
             return self._request(path, version=version)[1]
         except RuntimeError as e:
-            if "client-token" in str(e) or "401" in str(e):
-                log.info("Session IG expirée — reconnexion…")
+            msg = str(e)
+            if "client-token" in msg or "401" in msg or "api-key-invalid" in msg:
+                log.info("Session IG à renouveler — reconnexion…")
                 self.login()
                 return self._request(path, version=version)[1]
             raise
@@ -648,10 +652,21 @@ def main():
     eod_t = dtime(*map(int, cfg["schedule"]["eod_sync"].split(":")))
     tg_alert(cfg, f"[OK] Pont démarré (dry_run={cfg['dry_run']})")
 
+    was_in_window = True  # on vient de démarrer/réconcilier en fenêtre
     while True:
         try:
             now = datetime.now()
-            if in_window(cfg, now):
+            in_now = in_window(cfg, now)
+            # Réveil : à l'entrée dans la fenêtre de trading (après la nuit/le week-end),
+            # la session IG a pu expirer → on la rafraîchit avant de trader.
+            if in_now and not was_in_window:
+                log.info("Entrée en fenêtre de trading — rafraîchissement de la session IG.")
+                try:
+                    ig.login()
+                except Exception as e:
+                    log.warning(f"Re-login au réveil échoué (sera retenté) : {e}")
+            was_in_window = in_now
+            if in_now:
                 # Garde-fou : si le terminal MT5 s'est fermé/déconnecté, le relancer
                 # avant de trader (sinon le cycle échouerait).
                 if not mt5_alive():
