@@ -180,7 +180,7 @@ class IGClient:
             headers["Content-Type"] = "application/json; charset=UTF-8"
         req = urllib.request.Request(IG_BASE + path, data=data, headers=headers, method=method)
         try:
-            with urllib.request.urlopen(req, timeout=20) as r:
+            with urllib.request.urlopen(req, timeout=30) as r:  # 30s : tolère un réseau lent
                 return dict(r.headers), json.loads(r.read().decode())
         except urllib.error.HTTPError as e:
             detail = e.read().decode(errors="replace")[:300]
@@ -653,6 +653,7 @@ def main():
     tg_alert(cfg, f"[OK] Pont démarré (dry_run={cfg['dry_run']})")
 
     was_in_window = True  # on vient de démarrer/réconcilier en fenêtre
+    err_streak = 0        # erreurs consécutives (pour ne notifier que si ça persiste)
     while True:
         try:
             now = datetime.now()
@@ -690,17 +691,20 @@ def main():
                 if now.time() >= eod_t and eod_done != now.date():
                     eod_failsafe(cfg, ig, state)
                     eod_done = now.date()
+            err_streak = 0  # cycle réussi → on oublie les hoquets passés
             time.sleep(cfg.get("poll_seconds", 5))
         except KeyboardInterrupt:
             log.info("Arrêt demandé. Les stops catastrophe restent en place sur MT5.")
             break
         except Exception as e:
-            log.error(f"Erreur boucle : {e}")
-            indice = ""
-            if "api-key-invalid" in str(e):
-                indice = " (clé IG suspendue : utilisée en parallèle ailleurs ? — voir clé dédiée)"
-            tg_alert(cfg, f"[!] Erreur : {e}{indice} — nouvel essai dans 20 s")
-            time.sleep(20)
+            err_streak += 1
+            log.error(f"Erreur boucle (#{err_streak}) : {e}")
+            # Notif Telegram seulement si l'erreur PERSISTE (≥3 d'affilée) — évite
+            # le spam pour un hoquet réseau isolé (timeout TLS, coupure brève…).
+            if err_streak >= 3:
+                indice = " (clé IG suspendue ?)" if "api-key-invalid" in str(e) else ""
+                tg_alert(cfg, f"[!] Erreur persistante (x{err_streak}){indice} : {e}")
+            time.sleep(15)
             try:
                 ig.login()
             except Exception as e2:
