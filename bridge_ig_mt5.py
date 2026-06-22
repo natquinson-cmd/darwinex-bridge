@@ -603,8 +603,14 @@ def eod_failsafe(cfg, ig, state):
 # BOUCLE PRINCIPALE
 # ══════════════════════════════════════════════════════════════════════════
 def in_window(cfg, now=None):
+    # 24/7 : une position ouverte peut être fermée par IG à TOUTE heure (nuit,
+    # week-end, jour férié — ex. clôture à minuit). Le pont doit donc surveiller
+    # en permanence pour répliquer la fermeture sans attendre. L'ancienne fenêtre
+    # 7h25-22h20 faisait dormir le pont et retardait ces clôtures de plusieurs heures.
+    if cfg.get("schedule", {}).get("always_on", True):
+        return True
     now = now or datetime.now()
-    if now.weekday() >= 5:  # samedi/dimanche
+    if now.weekday() >= 5:
         return False
     start = dtime(*map(int, cfg["schedule"]["start"].split(":")))
     stop = dtime(*map(int, cfg["schedule"]["stop"].split(":")))
