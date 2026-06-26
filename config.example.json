@@ -15,9 +15,10 @@
     "account_id": "UUID_DU_COMPTE_AJOUTE_SUR_METAAPI"
   },
   "mapping": {
-    "NASDAQ": { "mt5_symbol": "auto", "patterns": ["NDX", "NAS100", "USTEC", "US100", "NASDAQ"] },
-    "DAX":    { "mt5_symbol": "auto", "patterns": ["GDAXI", "GER40", "DE40", "DAX"] }
+    "NASDAQ": { "mt5_symbol": "auto", "patterns": ["NDX", "NAS100", "USTEC", "US100", "NASDAQ"], "ig_value_per_point": 1 },
+    "DAX":    { "mt5_symbol": "auto", "patterns": ["GDAXI", "GER40", "DE40", "DAX"], "ig_value_per_point": 5 }
   },
+  "_comment_ig_value_per_point": "Valeur d'1 point pour 1 contrat IG (cf nom IG : '(1€)' -> 1, '(5€)' -> 5). Optionnel : si absent, le pont le lit dans le nom de l'instrument IG.",
   "risk": {
     "catastrophe_stop_pct": 3.0,
     "max_volume_lots": 20

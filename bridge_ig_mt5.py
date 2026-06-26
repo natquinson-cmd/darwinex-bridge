@@ -8,9 +8,11 @@
  sur MT5 ; chaque position qui DISPARAÎT chez IG est fermée sur MT5.
  Aucune décision de trading n'est prise ici — IG est la source de vérité.
 
- Sizing : réplication du risque relatif. IG donne la taille en €/point ;
- on applique le même €/point *proportionnellement à l'équité* du compte
- MT5 (mode "réinvestissement" : les tailles suivent le capital).
+ Sizing : réplication du risque relatif. IG donne la taille en CONTRATS,
+ qu'on convertit en €/point via la valeur d'1 point d'1 contrat
+ (« US Tech 100 (1€) » -> 1, « Allemagne 40 (5€) » -> 5). On applique
+ ensuite le même €/point *proportionnellement à l'équité* du compte MT5
+ (mode "réinvestissement" : les tailles suivent le capital).
 
  Garde-fous :
    1. Stop catastrophe posé sur chaque position MT5 dès l'ouverture
@@ -28,6 +30,7 @@
 import json
 import logging
 import os
+import re
 import sys
 import time
 import urllib.request
@@ -223,7 +226,7 @@ class IGClient:
             out[deal_id] = {
                 "dealId": deal_id,
                 "direction": pos.get("direction"),               # BUY / SELL
-                "size": float(pos.get("size") or pos.get("dealSize") or 0),  # € / point
+                "size": float(pos.get("size") or pos.get("dealSize") or 0),  # taille en CONTRATS IG (≠ €/point : cf ig_value_per_point)
                 "level": float(pos.get("level") or 0),
                 "epic": mkt.get("epic", ""),
                 "name": mkt.get("instrumentName", ""),
@@ -434,6 +437,28 @@ def classify(ig_pos):
     return None
 
 
+def ig_value_per_point(name, kind, cfg):
+    """Valeur (devise IG) d'1 point pour 1 CONTRAT IG.
+
+    IG renvoie la taille de position en contrats, or 1 contrat ne vaut pas
+    toujours 1 €/point selon l'instrument :
+        « US Tech 100 au comptant (1€) »  -> 1   (NASDAQ : contrats == €/point)
+        « Allemagne 40 au comptant (5€) » -> 5   (DAX : 1 contrat = 5 €/point)
+    Sans cette conversion, le DAX était sous-dimensionné d'un facteur 5 sur MT5.
+
+    Priorité :
+      1. override explicite config (mapping.<kind>.ig_value_per_point)
+      2. parsing du nom IG « (5€) » / « (1€) »
+      3. repli 1.0 (comportement historique, correct pour le NASDAQ 1€)."""
+    over = (cfg.get("mapping", {}).get(kind) or {}).get("ig_value_per_point")
+    if over:
+        return float(over)
+    m = re.search(r"\(\s*([\d]+(?:[.,][\d]+)?)\s*[€$£]\s*\)", name or "")
+    if m:
+        return float(m.group(1).replace(",", "."))
+    return 1.0
+
+
 def instrument_display(symbol_or_kind):
     """(drapeau, nom lisible) pour les notifs Telegram, à partir du kind
     (NASDAQ/DAX) ou du symbole MT5 (NDX/GDAXI)."""
@@ -467,7 +492,9 @@ def sync_cycle(cfg, ig, state, symbols):
             continue
         ig_eq = ig.equity()
         mt5_eq = mt5.account_info().equity
-        vol = compute_volume(symbol, p["size"], ig_eq, mt5_eq, cfg["risk"])
+        vpp = ig_value_per_point(p["name"], kind, cfg)   # €/point pour 1 contrat IG
+        ig_eur_pt = p["size"] * vpp                       # vraie taille IG en €/point
+        vol = compute_volume(symbol, ig_eur_pt, ig_eq, mt5_eq, cfg["risk"])
         if not vol:
             log.error(f"Volume incalculable pour {deal_id} ({symbol}).")
             continue
@@ -480,7 +507,8 @@ def sync_cycle(cfg, ig, state, symbols):
         known[deal_id] = {"ticket": ticket, "symbol": symbol, "volume": vol, "ig_size": p["size"]}
         save_state(state)
         entree = exec_price or p["level"]  # prix d'entrée Darwinex réel (cohérent avec la clôture)
-        log.info(f"[OUVERT] {symbol} {p['direction']} vol={vol} @ {entree} (IG @ {p['level']})")
+        log.info(f"[OUVERT] {symbol} {p['direction']} vol={vol} @ {entree} "
+                 f"(IG @ {p['level']} · {p['size']}c × {vpp:g} = {ig_eur_pt:g} €/pt)")
         sens = "⬆️ ACHAT" if p["direction"] == "BUY" else "⬇️ VENTE"
         flag, name = instrument_display(kind)
         tg_alert(cfg, f"{flag} {name}  {sens}\n{vol} lot · entrée {entree}")
