@@ -1,8 +1,0 @@
-config.json
-bridge.log
-bridge_metaapi.log
-bridge_state.json
-bridge_state_metaapi.json
-bridge.lock
-__pycache__/
-*.zip

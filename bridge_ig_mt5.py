@@ -325,9 +325,12 @@ def compute_volume(symbol, ig_size_eur_pt, ig_equity, mt5_equity, risk_cfg):
 
 
 def mt5_open(symbol, direction, volume, stop_pct, dry_run, deal_id):
+    """Ouvre la position sur MT5. Retourne (ticket, err, prix_exécution_réel).
+    Le prix d'exécution est celui du compte Darwinex (pas IG) — c'est lui qu'on
+    affiche, pour être cohérent avec le prix d'entrée montré à la clôture."""
     tick = mt5.symbol_info_tick(symbol)
     if tick is None:
-        return None, f"Pas de cotation pour {symbol}"
+        return None, f"Pas de cotation pour {symbol}", None
     buy = direction == "BUY"
     price = tick.ask if buy else tick.bid
     sl = price * (1 - stop_pct / 100) if buy else price * (1 + stop_pct / 100)
@@ -335,7 +338,7 @@ def mt5_open(symbol, direction, volume, stop_pct, dry_run, deal_id):
     sl = round(sl, si.digits)
     if dry_run:
         log.info(f"[DRY-RUN] OUVERTURE {symbol} {direction} vol={volume} @~{price} SL={sl}")
-        return -1, None
+        return -1, None, price
     req = {
         "action": mt5.TRADE_ACTION_DEAL,
         "symbol": symbol,
@@ -352,13 +355,13 @@ def mt5_open(symbol, direction, volume, stop_pct, dry_run, deal_id):
     }
     res = mt5.order_send(req)
     if res is None:
-        return None, f"order_send None : {mt5.last_error()}"
+        return None, f"order_send None : {mt5.last_error()}", None
     if res.retcode == mt5.TRADE_RETCODE_INVALID_FILL:  # certains serveurs exigent IOC
         req["type_filling"] = mt5.ORDER_FILLING_IOC
         res = mt5.order_send(req)
     if res.retcode != mt5.TRADE_RETCODE_DONE:
-        return None, f"retcode={res.retcode} {res.comment}"
-    return res.order, None
+        return None, f"retcode={res.retcode} {res.comment}", None
+    return res.order, None, res.price
 
 
 def mt5_close(ticket, dry_run):
@@ -468,18 +471,19 @@ def sync_cycle(cfg, ig, state, symbols):
         if not vol:
             log.error(f"Volume incalculable pour {deal_id} ({symbol}).")
             continue
-        ticket, err = mt5_open(symbol, p["direction"], vol,
-                               cfg["risk"]["catastrophe_stop_pct"], cfg["dry_run"], deal_id)
+        ticket, err, exec_price = mt5_open(symbol, p["direction"], vol,
+                                           cfg["risk"]["catastrophe_stop_pct"], cfg["dry_run"], deal_id)
         if err:
             log.error(f"OUVERTURE ÉCHOUÉE {symbol} {p['direction']} : {err}")
             tg_alert(cfg, f"[ERREUR] Échec ouverture {symbol} {p['direction']} ({err})")
             continue
         known[deal_id] = {"ticket": ticket, "symbol": symbol, "volume": vol, "ig_size": p["size"]}
         save_state(state)
-        log.info(f"[OUVERT] {symbol} {p['direction']} vol={vol} (IG {p['size']}EUR/pt @ {p['level']})")
+        entree = exec_price or p["level"]  # prix d'entrée Darwinex réel (cohérent avec la clôture)
+        log.info(f"[OUVERT] {symbol} {p['direction']} vol={vol} @ {entree} (IG @ {p['level']})")
         sens = "⬆️ ACHAT" if p["direction"] == "BUY" else "⬇️ VENTE"
         flag, name = instrument_display(kind)
-        tg_alert(cfg, f"{flag} {name}  {sens}\n{vol} lot · entrée {p['level']}")
+        tg_alert(cfg, f"{flag} {name}  {sens}\n{vol} lot · entrée {entree}")
 
     # 2) FERMETURES : miroirs dont la position IG a disparu
     for deal_id in [d for d in list(known) if d not in ig_pos]:
@@ -498,15 +502,20 @@ def sync_cycle(cfg, ig, state, symbols):
             if info and info.get("pnl") is not None:
                 pnl, cur, pct = info["pnl"], info["currency"], info["pct"]
                 gain = pnl >= 0
+                # Points gagnés/perdus (signe = sens du résultat : + = gain)
+                pts = None
+                po, pc = info.get("price_open"), info.get("price_close")
+                if po and pc:
+                    pts = (pc - po) if info["direction"] == "BUY" else (po - pc)
+                pts_txt = f", {pts:+.1f} pts" if pts is not None else ""
                 # console (texte simple, lisible dans voir_pont.bat)
-                log.info(f"[FERME] {sym} vol={vol} PnL={pnl:+.0f} {cur} ({pct:+.2f}%) (IG {deal_id})")
-                # Telegram : gros emoji de couleur + montant en GRAS (lisible sur fond
-                # sombre, gain comme perte — le bloc diff rendait le rouge peu lisible).
+                log.info(f"[FERME] {sym} vol={vol} PnL={pnl:+.0f} {cur} ({pct:+.2f}%{pts_txt}) (IG {deal_id})")
+                # Telegram : gros emoji de couleur + montant en GRAS (lisible sur fond sombre)
                 head = "🟢 GAIN" if gain else "🔴 PERTE"
                 flag, name = instrument_display(sym)
                 detail = ""
-                if info.get("price_open") and info.get("price_close"):
-                    detail = f"\n{info['direction']} {vol} lot · {info['price_open']} → {info['price_close']}"
+                if po and pc:
+                    detail = f"\n{info['direction']} {vol} lot · {po} → {pc}  (<b>{pts:+.1f} pts</b>)"
                 tg_alert(cfg,
                          f"{head} — {flag} <b>{name}</b> clôturé\n"
                          f"{head[0]} <b>{pnl:+.0f} {cur}</b>   (<b>{pct:+.2f} %</b>){detail}",
