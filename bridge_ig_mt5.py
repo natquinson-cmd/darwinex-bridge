@@ -52,6 +52,16 @@ LOG_FILE = HERE / "bridge.log"
 
 MAGIC = 20260611  # signature des ordres posés par le pont
 
+# ── Battement de cœur (lu par le Trading Dashboard) ───────────────────────
+# Sans lui, un pont MORT est indiscernable d'un pont qui n'a simplement rien à
+# répliquer : le 09/09/2026, un redémarrage Windows l'a arrêté et deux trades DAX
+# sont passés à la trappe sans la moindre alerte (un processus mort n'alerte pas).
+DEFAULT_FB_URL = "https://portfolio-dashboard-f0c69-default-rtdb.firebaseio.com"
+FB_HEARTBEAT_PATH = "dashboard/pontIG"
+HEARTBEAT_SECONDS = 60          # 1 écriture/minute au plus (la boucle tourne toutes les 5 s)
+_last_hb = 0.0                  # horodatage du dernier envoi
+_last_event = None              # dernier événement notable, joint au prochain battement
+
 # ── Verrou anti-doublon ────────────────────────────────────────────────────
 # Garantit qu'UN SEUL pont peut tourner. Si un second démarre, il ne peut pas
 # acquérir le verrou et s'arrête immédiatement → JAMAIS de positions en double.
@@ -155,6 +165,62 @@ def tg_alert(cfg, msg, parse_mode=None):
         except Exception as e:  # l'alerte ne doit jamais faire tomber le pont
             last = e
     log.warning(f"Alerte Telegram impossible : {last}")
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# BATTEMENT DE CŒUR FIREBASE (jamais bloquant)
+# ══════════════════════════════════════════════════════════════════════════
+def fb_write(cfg, path, payload):
+    """Écrit dans Firebase. NE DOIT JAMAIS faire tomber le pont : on avale tout.
+    Désactivable par config : {"firebase": {"disabled": true}}."""
+    fb = cfg.get("firebase", {}) or {}
+    if fb.get("disabled"):
+        return
+    url = fb.get("db_url") or DEFAULT_FB_URL
+    try:
+        full = url.rstrip("/") + "/" + path.strip("/") + ".json"
+        data = json.dumps(payload).encode()
+        req = urllib.request.Request(full, data=data,
+                                     headers={"Content-Type": "application/json"}, method="PUT")
+        urllib.request.urlopen(req, timeout=8).read()
+    except Exception as e:
+        log.debug(f"Firebase indisponible ({e})")   # volontairement silencieux
+
+
+def note_event(txt):
+    """Mémorise le dernier événement notable, joint au prochain battement."""
+    global _last_event
+    _last_event = str(txt)[:200]
+
+
+def heartbeat(cfg, state, event=None, ok=True, force=False):
+    """Publie l'état vivant du pont. Limité à 1 écriture par minute sauf force=True.
+    Ne fait AUCUN appel réseau vers IG : uniquement des données déjà en mémoire."""
+    global _last_hb
+    now = time.time()
+    if not force and (now - _last_hb) < HEARTBEAT_SECONDS:
+        return
+    _last_hb = now
+    if event:
+        note_event(event)
+    acc = None
+    try:
+        acc = mt5.account_info() if mt5 is not None else None
+    except Exception:
+        pass
+    mirrors = sum(1 for e in (state.get("map") or {}).values()
+                  if isinstance(e, dict) and not e.get("ignored") and e.get("ticket") not in (None, -1))
+    payload = {
+        "at": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "ok": bool(ok),
+        "dryRun": bool(cfg.get("dry_run")),
+        "mirrors": mirrors,
+        "mt5Connected": acc is not None,
+        "mt5Equity": round(float(acc.equity), 2) if acc else None,
+        "mt5Currency": (acc.currency if acc else None),
+        "lastEvent": _last_event,
+    }
+    fb_write(cfg, FB_HEARTBEAT_PATH, payload)
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -509,6 +575,7 @@ def sync_cycle(cfg, ig, state, symbols):
         entree = exec_price or p["level"]  # prix d'entrée Darwinex réel (cohérent avec la clôture)
         log.info(f"[OUVERT] {symbol} {p['direction']} vol={vol} @ {entree} "
                  f"(IG @ {p['level']} · {p['size']}c × {vpp:g} = {ig_eur_pt:g} €/pt)")
+        note_event(f"ouverture {symbol} {p['direction']} vol={vol}")
         sens = "⬆️ ACHAT" if p["direction"] == "BUY" else "⬇️ VENTE"
         flag, name = instrument_display(kind)
         tg_alert(cfg, f"{flag} {name}  {sens}\n{vol} lot · entrée {entree}")
@@ -538,6 +605,7 @@ def sync_cycle(cfg, ig, state, symbols):
                 pts_txt = f", {pts:+.1f} pts" if pts is not None else ""
                 # console (texte simple, lisible dans voir_pont.bat)
                 log.info(f"[FERME] {sym} vol={vol} PnL={pnl:+.0f} {cur} ({pct:+.2f}%{pts_txt}) (IG {deal_id})")
+                note_event(f"fermeture {sym} PnL {pnl:+.0f} {cur} ({pct:+.2f} %)")
                 # Telegram : gros emoji de couleur + montant en GRAS (lisible sur fond sombre)
                 head = "🟢 GAIN" if gain else "🔴 PERTE"
                 flag, name = instrument_display(sym)
@@ -694,6 +762,7 @@ def main():
     eod_done = None
     eod_t = dtime(*map(int, cfg["schedule"]["eod_sync"].split(":")))
     tg_alert(cfg, f"[OK] Pont démarré (dry_run={cfg['dry_run']})")
+    heartbeat(cfg, state, event="démarrage du pont", force=True)
 
     was_in_window = True  # on vient de démarrer/réconcilier en fenêtre
     err_streak = 0        # erreurs consécutives (pour ne notifier que si ça persiste)
@@ -735,13 +804,16 @@ def main():
                     eod_failsafe(cfg, ig, state)
                     eod_done = now.date()
             err_streak = 0  # cycle réussi → on oublie les hoquets passés
+            heartbeat(cfg, state)          # 1 écriture/min : le dashboard voit que le pont vit
             time.sleep(cfg.get("poll_seconds", 5))
         except KeyboardInterrupt:
             log.info("Arrêt demandé. Les stops catastrophe restent en place sur MT5.")
+            heartbeat(cfg, state, event="arrêt manuel", ok=False, force=True)
             break
         except Exception as e:
             err_streak += 1
             log.error(f"Erreur boucle (#{err_streak}) : {e}")
+            heartbeat(cfg, state, event=f"erreur (x{err_streak}) : {e}", ok=False, force=True)
             # Notif Telegram seulement si l'erreur PERSISTE (≥3 d'affilée) — évite
             # le spam pour un hoquet réseau isolé (timeout TLS, coupure brève…).
             if err_streak >= 3:
