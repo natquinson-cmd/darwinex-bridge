@@ -352,6 +352,41 @@ def mt5_connect(cfg, fatal=True):
     return info
 
 
+def mt5_connect_retry(cfg, state=None, attempts=5, delay=20):
+    """Connexion MT5 PATIENTE, à utiliser au démarrage.
+
+    Au redémarrage du VPS, la tâche planifiée part à l'ouverture de session pendant que
+    MetaTrader 5 est encore en train de se lancer et de se connecter au compte. L'ancien
+    code abandonnait dès le premier échec :
+        08/09/2026 23:45:34  démarrage, IG OK
+        08/09/2026 23:47:27  Échec connexion MT5 (-10003, "IPC initialize failed,
+                             Pipe server didn't answer in 60 sec")  -> sys.exit(1)
+    Le pont est resté mort toute la nuit et deux trades DAX du lendemain matin n'ont pas
+    été répliqués. On patiente donc : mt5.initialize() met déjà ~60 s à échouer, donc
+    5 tentatives espacées de 20 s couvrent environ 6 à 7 minutes de démarrage de MT5."""
+    for i in range(1, attempts + 1):
+        info = mt5_connect(cfg, fatal=False)
+        if info is not None:
+            if i > 1:
+                log.info(f"MT5 disponible après {i} tentative(s).")
+            return info
+        if i < attempts:
+            log.warning(f"MT5 pas encore prêt (tentative {i}/{attempts}) — nouvel essai dans {delay} s…")
+            try:
+                mt5.shutdown()
+            except Exception:
+                pass
+            time.sleep(delay)
+    # Echec definitif : on PREVIENT au lieu de mourir en silence (la tache lance pythonw.exe,
+    # sans console : sans alerte ni battement, personne ne voit rien avant le lendemain).
+    log.error(f"MT5 injoignable après {attempts} tentatives — arrêt du pont.")
+    tg_alert(cfg, f"[!] Pont NON démarré : MT5 injoignable après {attempts} tentatives. "
+                  f"Vérifie que MetaTrader 5 est lancé et connecté au compte {cfg['mt5']['login']}.")
+    if state is not None:
+        heartbeat(cfg, state, event="MT5 injoignable au démarrage", ok=False, force=True)
+    sys.exit(1)
+
+
 def mt5_alive():
     """True si le terminal MT5 répond et reste connecté au compte."""
     try:
@@ -739,7 +774,7 @@ def main():
     ig.login()
     log.info(f"Équité IG : {ig.equity():.2f} € — positions ouvertes : {len(ig.positions())}")
 
-    mt5_connect(cfg)
+    mt5_connect_retry(cfg, state)   # patiente : MT5 peut encore se lancer au boot du VPS
     symbols = {}
     for kind, mcfg in cfg["mapping"].items():
         sym = mcfg["mt5_symbol"] if mcfg.get("mt5_symbol") not in ("", "auto", None) \
