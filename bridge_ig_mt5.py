@@ -62,6 +62,15 @@ HEARTBEAT_SECONDS = 60          # 1 écriture/minute au plus (la boucle tourne t
 _last_hb = 0.0                  # horodatage du dernier envoi
 _last_event = None              # dernier événement notable, joint au prochain battement
 
+# ── P&L latent en direct (lu par le Trading Dashboard) ──────────────────────
+# Calculé depuis la réponse /positions que le cycle reçoit DÉJÀ : aucune requête IG en plus.
+# Nœud SÉPARÉ de FB_HEARTBEAT_PATH : le battement y fait un PUT qui effacerait un sous-nœud.
+FB_LIVE_PATH = "dashboard/pontLive"
+LIVE_SECONDS = 5                # 1 écriture / 5 s au plus tant qu'une position est ouverte
+_last_live = 0.0                # horodatage du dernier envoi
+_live_open = False              # dernier envoi : au moins une position ouverte ?
+_live_retry = 0.0               # Firebase injoignable : pas de nouvel essai avant cet instant
+
 # ── Verrou anti-doublon ────────────────────────────────────────────────────
 # Garantit qu'UN SEUL pont peut tourner. Si un second démarre, il ne peut pas
 # acquérir le verrou et s'arrête immédiatement → JAMAIS de positions en double.
@@ -170,21 +179,23 @@ def tg_alert(cfg, msg, parse_mode=None):
 # ══════════════════════════════════════════════════════════════════════════
 # BATTEMENT DE CŒUR FIREBASE (jamais bloquant)
 # ══════════════════════════════════════════════════════════════════════════
-def fb_write(cfg, path, payload):
+def fb_write(cfg, path, payload, timeout=8):
     """Écrit dans Firebase. NE DOIT JAMAIS faire tomber le pont : on avale tout.
     Désactivable par config : {"firebase": {"disabled": true}}."""
     fb = cfg.get("firebase", {}) or {}
     if fb.get("disabled"):
-        return
+        return False
     url = fb.get("db_url") or DEFAULT_FB_URL
     try:
         full = url.rstrip("/") + "/" + path.strip("/") + ".json"
         data = json.dumps(payload).encode()
         req = urllib.request.Request(full, data=data,
                                      headers={"Content-Type": "application/json"}, method="PUT")
-        urllib.request.urlopen(req, timeout=8).read()
+        urllib.request.urlopen(req, timeout=timeout).read()
+        return True
     except Exception as e:
         log.debug(f"Firebase indisponible ({e})")   # volontairement silencieux
+        return False
 
 
 def note_event(txt):
@@ -296,6 +307,9 @@ class IGClient:
                 "level": float(pos.get("level") or 0),
                 "epic": mkt.get("epic", ""),
                 "name": mkt.get("instrumentName", ""),
+                # cours du marché dans la MÊME réponse : sert au P&L latent du dashboard (live_push)
+                "bid": _num(mkt.get("bid")),
+                "offer": _num(mkt.get("offer")),
             }
         return out
 
@@ -571,11 +585,59 @@ def instrument_display(symbol_or_kind):
     return "", str(symbol_or_kind)
 
 
+def _num(v):
+    """Nombre ou None, sans jamais lever : un cours illisible ne doit pas casser la lecture des positions."""
+    try:
+        return float(v) if v is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def live_push(cfg, ig_pos):
+    """P&L latent des positions IG ouvertes -> Firebase (FB_LIVE_PATH), pour le dashboard.
+    Données déjà en mémoire (réponse /positions du cycle) : AUCUNE requête IG. Au plus une écriture
+    toutes les LIVE_SECONDS tant qu'une position est ouverte, puis une seule « aucune position ».
+    Ne lève JAMAIS : la réplication passe avant l'affichage."""
+    global _last_live, _live_open, _live_retry
+    try:
+        now = time.time()
+        if now < _live_retry:
+            return                                          # Firebase injoignable : on attend
+        rows = []
+        for p in ig_pos.values():
+            kind = classify(p)
+            bid, offer, lvl, size = p.get("bid"), p.get("offer"), p.get("level"), p.get("size")
+            if kind is None or bid is None or offer is None or not lvl or not size:
+                continue
+            buy = p.get("direction") == "BUY"
+            sortie = bid if buy else offer                  # cours auquel la position se fermerait
+            pts = (sortie - lvl) if buy else (lvl - sortie)
+            vpp = ig_value_per_point(p.get("name"), kind, cfg)
+            rows.append({"kind": kind, "direction": p.get("direction"), "size": size, "level": lvl,
+                         "exit": sortie, "points": round(pts, 1), "pnl": round(pts * size * vpp, 2)})
+        if rows:
+            if now - _last_live < LIVE_SECONDS:
+                return
+        elif not _live_open and _last_live:
+            return                                          # « aucune position » déjà publié
+        ok = fb_write(cfg, FB_LIVE_PATH, {"at": datetime.now().astimezone().isoformat(timespec="seconds"),
+                                          "positions": rows, "pnl": round(sum(r["pnl"] for r in rows), 2)},
+                      timeout=2)
+        if ok:
+            _last_live, _live_open = now, bool(rows)
+        else:
+            _live_retry = now + 60      # ne jamais ralentir la réplication : un essai par minute au plus
+
+    except Exception as e:
+        log.debug(f"live_push : {e}")
+
+
 # ══════════════════════════════════════════════════════════════════════════
 # CŒUR : un cycle de synchronisation
 # ══════════════════════════════════════════════════════════════════════════
 def sync_cycle(cfg, ig, state, symbols):
     ig_pos = ig.positions()
+    live_push(cfg, ig_pos)          # P&L latent pour le dashboard (aucune requête IG, n'échoue jamais)
     known = state["map"]
 
     # 1) OUVERTURES : positions IG sans miroir MT5
