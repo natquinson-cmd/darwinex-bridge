@@ -310,6 +310,10 @@ class IGClient:
                 # cours du marché dans la MÊME réponse : sert au P&L latent du dashboard (live_push)
                 "bid": _num(mkt.get("bid")),
                 "offer": _num(mkt.get("offer")),
+                # stop et objectif de la position (même réponse) : le dashboard dit si elle est « sécurisée »
+                "stop": _num(pos.get("stopLevel")),
+                "limit": _num(pos.get("limitLevel")),
+                "trailing": _num(pos.get("trailingStopDistance")),
             }
         return out
 
@@ -613,8 +617,18 @@ def live_push(cfg, ig_pos):
             sortie = bid if buy else offer                  # cours auquel la position se fermerait
             pts = (sortie - lvl) if buy else (lvl - sortie)
             vpp = ig_value_per_point(p.get("name"), kind, cfg)
-            rows.append({"kind": kind, "direction": p.get("direction"), "size": size, "level": lvl,
-                         "exit": sortie, "points": round(pts, 1), "pnl": round(pts * size * vpp, 2)})
+            row = {"kind": kind, "direction": p.get("direction"), "size": size, "level": lvl,
+                   "exit": sortie, "points": round(pts, 1), "pnl": round(pts * size * vpp, 2)}
+            stop = p.get("stop")
+            if stop:
+                # points garantis si le stop est touché : > 0 position SÉCURISÉE, 0 point mort, < 0 risque restant
+                garanti = (stop - lvl) if buy else (lvl - stop)
+                row.update({"stop": stop, "secured": round(garanti, 1), "securedEur": round(garanti * size * vpp, 2)})
+            if p.get("limit"):
+                row["limit"] = p["limit"]
+            if p.get("trailing"):
+                row["trailing"] = p["trailing"]
+            rows.append(row)
         if rows:
             if now - _last_live < LIVE_SECONDS:
                 return
