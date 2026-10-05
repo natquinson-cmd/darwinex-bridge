@@ -33,6 +33,7 @@ import os
 import re
 import sys
 import time
+import urllib.parse
 import urllib.request
 import urllib.error
 from datetime import datetime, time as dtime
@@ -181,13 +182,18 @@ def tg_alert(cfg, msg, parse_mode=None):
 # ══════════════════════════════════════════════════════════════════════════
 def fb_write(cfg, path, payload, timeout=8):
     """Écrit dans Firebase. NE DOIT JAMAIS faire tomber le pont : on avale tout.
-    Désactivable par config : {"firebase": {"disabled": true}}."""
+    Désactivable par config : {"firebase": {"disabled": true}}.
+    Clé secrète de la base (règles verrouillées, 05/10/2026) : variable d'environnement FIREBASE_DB_SECRET,
+    sinon config.json {"firebase": {"secret": "..."}} (fichier local, jamais versionné). Sans clé : comme avant."""
     fb = cfg.get("firebase", {}) or {}
     if fb.get("disabled"):
         return False
     url = fb.get("db_url") or DEFAULT_FB_URL
+    secret = os.environ.get("FIREBASE_DB_SECRET") or fb.get("secret")
     try:
         full = url.rstrip("/") + "/" + path.strip("/") + ".json"
+        if secret:
+            full += "?auth=" + urllib.parse.quote(secret, safe="")
         data = json.dumps(payload).encode()
         req = urllib.request.Request(full, data=data,
                                      headers={"Content-Type": "application/json"}, method="PUT")
