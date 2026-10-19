@@ -2,7 +2,8 @@
   "ig": {
     "api_key": "VOTRE_CLE_API_IG",
     "username": "VOTRE_IDENTIFIANT_IG",
-    "password": "VOTRE_MOT_DE_PASSE_IG"
+    "password": "VOTRE_MOT_DE_PASSE_IG",
+    "totp_secret": ""
   },
   "mt5": {
     "login": 4000093713,

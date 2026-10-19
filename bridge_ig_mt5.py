@@ -27,10 +27,14 @@
    python bridge_ig_mt5.py --once     # un seul cycle de poll (debug)
 ═══════════════════════════════════════════════════════════════════════════
 """
+import base64
+import hashlib
+import hmac
 import json
 import logging
 import os
 import re
+import struct
 import sys
 import time
 import urllib.parse
@@ -246,11 +250,40 @@ def heartbeat(cfg, state, event=None, ok=True, force=False):
 IG_BASE = "https://api.ig.com/gateway/deal"
 
 
+# ══════════════════════════════════════════════════════════════════════════
+# DOUBLE AUTHENTIFICATION IG (optionnelle, 19/10/2026)
+# ══════════════════════════════════════════════════════════════════════════
+# Avec la double authentification activée, l'API IG du compte réel exige le code à 6 chiffres
+# de l'appli d'authentification COLLÉ au mot de passe (FAQ IG). Le pont calcule lui-même ce code
+# (TOTP RFC 6238, comme Google Authenticator) à partir de la clé secrète affichée par IG à l'activation :
+# variable d'environnement IG_TOTP_SECRET, sinon config.json {"ig": {"totp_secret": "..."}}.
+# Sans clé : mot de passe seul, comme avant. L'horloge du VPS doit être à l'heure (codes de 30 s).
+def ig_totp_secret(ig_cfg):
+    return (os.environ.get("IG_TOTP_SECRET") or ig_cfg.get("totp_secret") or "").strip()
+
+
+def ig_totp(secret, t=None, step=30, digits=6):
+    """Code TOTP (HMAC-SHA1, 30 s, 6 chiffres) pour une clé base32."""
+    cle = re.sub(r"[\s-]", "", secret).upper()
+    cle = base64.b32decode(cle + "=" * (-len(cle) % 8))
+    compteur = int((time.time() if t is None else t) // step)
+    h = hmac.new(cle, struct.pack(">Q", compteur), hashlib.sha1).digest()
+    o = h[-1] & 0x0F
+    return str((struct.unpack(">I", h[o:o + 4])[0] & 0x7FFFFFFF) % (10 ** digits)).zfill(digits)
+
+
+def ig_identifiants_refuses(msg):
+    """Refus d'identifiants à la connexion (et non session expirée ou réseau)."""
+    return bool(re.search(r"invalid-details|error\.security\.|account-(locked|disabled|suspended)", msg))
+
+
+
 class IGClient:
     def __init__(self, cfg):
         self.cfg = cfg["ig"]
         self.cst = None
         self.xst = None
+        self._auth_pause = 0.0   # pas de nouvel essai de connexion avant cette heure (identifiants refusés)
 
     def _request(self, path, method="GET", version="2", body=None, auth=True):
         headers = {
@@ -273,9 +306,36 @@ class IGClient:
             raise RuntimeError(f"IG {method} {path} -> HTTP {e.code} : {detail}") from None
 
     def login(self):
-        hdrs, _ = self._request("/session", "POST", "2",
-                                {"identifier": self.cfg["username"], "password": self.cfg["password"]},
-                                auth=False)
+        # Identifiants refusés récemment : on ne recontacte pas IG avant la fin de la pause (anti-blocage du compte).
+        if time.time() < self._auth_pause:
+            raise RuntimeError("Connexion IG en pause jusqu'à "
+                               + datetime.fromtimestamp(self._auth_pause).strftime("%H:%M")
+                               + " : identifiants refusés au dernier essai.")
+        secret = ig_totp_secret(self.cfg)
+        essais = 2 if secret else 1   # avec code : un 2e essai sur le code suivant (code déjà utilisé, horloge limite)
+        for i in range(essais):
+            pwd = self.cfg["password"]
+            if secret:
+                reste = 30 - time.time() % 30
+                if reste < 3:              # code sur le point d'expirer : attendre le suivant
+                    time.sleep(reste + 0.5)
+                pwd += ig_totp(secret)
+            try:
+                hdrs, _ = self._request("/session", "POST", "2",
+                                        {"identifier": self.cfg["username"], "password": pwd},
+                                        auth=False)
+                break
+            except RuntimeError as e:
+                if not ig_identifiants_refuses(str(e)):
+                    raise
+                if i + 1 < essais:
+                    log.warning("IG refuse le code de double authentification, essai avec le code suivant…")
+                    time.sleep(30 - time.time() % 30 + 1)
+                    continue
+                self._auth_pause = time.time() + 15 * 60
+                conseil = (" Vérifier la clé IG_TOTP_SECRET et l'heure du VPS." if secret else
+                           " Si la double authentification IG est activée, renseigner IG_TOTP_SECRET.")
+                raise RuntimeError(f"IG refuse les identifiants ({e}).{conseil} Pause de 15 min.") from None
         self.cst = hdrs.get("CST") or hdrs.get("cst")
         self.xst = hdrs.get("X-SECURITY-TOKEN") or hdrs.get("x-security-token")
         if not self.cst or not self.xst:
@@ -853,7 +913,14 @@ def main():
 
     log.info(f"=== Démarrage du pont (dry_run={cfg['dry_run']}) ===")
     ig = IGClient(cfg)
-    ig.login()
+    try:
+        ig.login()
+    except Exception as e:
+        # Ne plus mourir en silence (tâche lancée par pythonw, sans console) : alerte + battement en erreur.
+        log.error(f"Connexion IG impossible au démarrage : {e}")
+        tg_alert(cfg, f"[!] Pont NON démarré : connexion IG impossible. {e}")
+        heartbeat(cfg, state, event=f"connexion IG impossible : {e}", ok=False, force=True)
+        raise
     log.info(f"Équité IG : {ig.equity():.2f} € — positions ouvertes : {len(ig.positions())}")
 
     mt5_connect_retry(cfg, state)   # patiente : MT5 peut encore se lancer au boot du VPS

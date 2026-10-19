@@ -75,3 +75,16 @@ et **arrêtez le pont du PC** (voir Règle d'or). La calibration Darwinex démar
 | Ordres refusés | Bouton « Algo Trading » pas activé (doit être vert) |
 | `⛔ Un autre pont tourne déjà` | Normal si déjà lancé — un seul tourne, c'est le but |
 | Rien dans le log après reboot | La tâche démarre **à l'ouverture de session** : il faut être connecté en RDP au moins une fois (ou configurer l'auto-login Windows du VPS) |
+
+## Double authentification IG (optionnelle)
+
+Avec la double authentification IG activée, l'API du compte réel exige le code à 6 chiffres collé au mot de passe.
+Le pont le calcule lui-même à partir de la **clé secrète** affichée par IG à l'activation (appli mobile IG, Compte puis Sécurité) :
+
+- de préférence en variable système, dans une invite de commandes **administrateur** du VPS :
+  `setx /M IG_TOTP_SECRET "LA_CLE_SECRETE_IG"` puis redémarrer le pont (`update.bat` ou la tâche `PontDarwinex`) ;
+- ou dans `config.json` : `"ig": { ..., "totp_secret": "LA_CLE_SECRETE_IG" }` (fichier local, jamais versionné).
+
+Sans clé, le pont se connecte comme avant avec le mot de passe seul. L'horloge du VPS doit être à l'heure (codes de 30 s).
+Si IG refuse les identifiants, le pont attend 15 min avant tout nouvel essai (IG bloque le compte après plusieurs échecs)
+et envoie une alerte Telegram.
